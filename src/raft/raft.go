@@ -19,12 +19,11 @@ package raft
 
 import (
 	//	"bytes"
-	"math/rand"
+
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
 	"../labrpc"
 )
 
@@ -51,12 +50,10 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-type NodeState int
-
 const (
-	StateFollower  NodeState = 0
-	StateCandidate NodeState = 1
-	StateLeader    NodeState = 2
+	ROLE_LEADER     = "Leader"
+	ROLE_FOLLOWER   = "Follower"
+	ROLE_CANDIDATES = "Candidates"
 )
 
 const (
@@ -80,22 +77,25 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	applyCh        chan ApplyMsg
-	applyCond      *sync.Cond   // used to wakeup applier goroutine after committing new entries
-	replicatorCond []*sync.Cond // used to signal replicator goroutine to batch replicating entries
-	state          NodeState
 
-	currentTerm int
-	vatedFor    int
-	logs        []LogEntry
+	// 所有服务器，持久化状态
+	currentTerm int        // 见过的最大任期
+	votedFor    int        // 记录在currentTerm任期投票给谁
+	logs        []LogEntry // 操作日志
 
-	commitIndex int
-	lastApplied int
-	nextIndex   []int
-	matchIndex  []int
+	// 所有服务器，易失状态
+	commitIndex int // 已知的最大已提交索引
+	lastApplied int // 当前应用到状态机的索引
 
-	electionTimer   *time.Timer
-	heartsbeatTimer *time.Timer
+	// 仅leader，易失状态（成为leader时重置）
+	nextIndex  []int // 每个follower的log同步起点索引
+	matchIndex []int // 每个follower的log同步进度，和nextIndex强关联
+
+	//所有服务器，选举相关状态
+	role              string
+	leaderId          int
+	lastActiveTime    time.Time // 上次活跃时间
+	lastBroadcastTime time.Time // 作为leader，上次的广播时间
 }
 
 type LogEntry struct {
@@ -111,6 +111,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	term = rf.currentTerm
+	isleader = rf.role == ROLE_LEADER
 	return term, isleader
 }
 
@@ -178,6 +180,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -186,13 +192,43 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []*LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
 }
 
 //
 // example RequestVote RPC handler.
 //
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) RequestVote(request *RequestVoteArgs, response *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
+	// defer DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v} before processing requestVoteRequest %v and reply requestVoteResponse %v", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, request, response)
+
+	if request.Term < rf.currentTerm || (request.Term == rf.currentTerm && rf.votedFor != -1 || rf.votedFor != request.CandidateId) {
+		response.Term, response.VoteGranted = rf.currentTerm, false
+	}
+
+	if request.Term > rf.currentTerm {
+		//rf.ChangeState(StateFollower)
+		rf.currentTerm, rf.votedFor = request.Term, -1
+	}
+
 }
 
 //
@@ -299,42 +335,33 @@ func (rf *Raft) ticker() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{
-		peers:           peers,
-		persister:       persister,
-		me:              me,
-		dead:            0,
-		applyCh:         applyCh,
-		replicatorCond:  make([]*sync.Cond, len(peers)),
-		state:           StateFollower,
-		currentTerm:     0,
-		vatedFor:        -1,
-		logs:            make([]LogEntry, 1),
-		nextIndex:       make([]int, len(peers)),
-		matchIndex:      make([]int, len(peers)),
-		heartsbeatTimer: time.NewTimer(HeartBeatTimeout),
-		electionTimer:   time.NewTimer(randElectionTimeout()),
-	}
+	rf := &Raft{}
+	rf.peers = peers
+	rf.persister = persister
+	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.role = ROLE_FOLLOWER
+	rf.leaderId = -1
+	rf.votedFor = -1
+	rf.lastActiveTime = time.Now()
 
-	// initialize from state persisted before a
-
+	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	rf.applyCond = sync.NewCond(&rf.mu)
 
-	for i := 0; i < len(peers); i++ {
-		rf.matchIndex[i], rf.nextIndex[i] = 0, lastLog.index+1
+	// election逻辑
+	go rf.electionLoop()
+	// 日志复制
+	go rf.appendEntriesLoop()
 
-	}
-
-	// start ticker goroutine to start elections
-	go rf.ticker()
-
+	DPrintf("Raftnode[%d]启动", me)
 	return rf
 }
 
-func randElectionTimeout() time.Duration {
-	r := time.Duration(rand.Int63()) % ElectionTimeout
-	return ElectionTimeout + r
+func (rf *Raft) electionLoop() {
+	// TODO
+}
+
+func (rf *Raft) appendEntriesLoop() {
+	// TODO
 }
