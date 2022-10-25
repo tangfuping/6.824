@@ -58,8 +58,8 @@ const (
 )
 
 const (
-	ElectionTimeout  = time.Millisecond * 300 // 选举
-	HeartBeatTimeout = time.Millisecond * 150 // leader 发送心跳
+	ElectionTimeout  = time.Millisecond * 300 // 选举超时时间
+	HeartBeatTimeout = time.Millisecond * 100 // leader 发送心跳
 	ApplyInterval    = time.Millisecond * 100 // apply log
 	RPCTimeout       = time.Millisecond * 100
 	MaxLockTime      = time.Millisecond * 10 // debug
@@ -387,7 +387,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) electionLoop() {
-	// TODO
 	for !rf.killed() {
 		time.Sleep(1 * time.Millisecond)
 
@@ -396,7 +395,7 @@ func (rf *Raft) electionLoop() {
 			defer rf.mu.Unlock()
 
 			now := time.Now()
-			timeout := time.Duration(200+rand.Int31n(150)) * time.Millisecond // 超时随机化
+			timeout := ElectionTimeout + time.Duration(rand.Int31n(150))*time.Millisecond // 超时随机化
 			elapses := now.Sub(rf.lastActiveTime)
 			// follower -> candidates
 			if rf.role == ROLE_FOLLOWER {
@@ -503,6 +502,97 @@ func (rf *Raft) electionLoop() {
 	}
 }
 
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	DPrintf("RaftNode[%d] Handle AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%s]",
+		rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.role)
+	defer func() {
+		DPrintf("RaftNode[%d] Return AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%s]",
+			rf.me, args.LeaderId, args.Term, rf.currentTerm, rf.role)
+	}()
+
+	reply.Term = rf.currentTerm
+	reply.Success = true
+
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	// 发现更大的任期，则转为该任期的follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.role = ROLE_FOLLOWER
+		rf.votedFor = -1
+		rf.leaderId = -1
+		// 继续往下走
+	}
+	// 认识新的leader
+	rf.leaderId = args.LeaderId
+	// 刷新活跃时间
+	rf.lastActiveTime = time.Now()
+
+	rf.persist()
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 func (rf *Raft) appendEntriesLoop() {
 	// TODO
+	for !rf.killed() {
+		time.Sleep(1 * time.Millisecond)
+
+		func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			// 只有leader才向外广播心跳
+			if rf.role != ROLE_LEADER {
+				return
+			}
+
+			// 100ms广播1次
+			now := time.Now()
+			if now.Sub(rf.lastBroadcastTime) < HeartBeatTimeout {
+				return
+			}
+			rf.lastBroadcastTime = time.Now()
+
+			// 并发RPC心跳
+			type AppendResult struct {
+				peerId int
+				resp   *AppendEntriesReply
+			}
+
+			for peerId := 0; peerId < len(rf.peers); peerId++ {
+				if peerId == rf.me {
+					continue
+				}
+
+				args := AppendEntriesArgs{}
+				args.Term = rf.currentTerm
+				args.LeaderId = rf.me
+				go func(id int, args1 *AppendEntriesArgs) {
+					DPrintf("RaftNode[%d] appendEntries starts, myTerm[%d] peerId[%d]", rf.me, args1.Term, id)
+					reply := AppendEntriesReply{}
+					if ok := rf.sendAppendEntries(id, args1, &reply); ok {
+						rf.mu.Lock()
+						defer rf.mu.Unlock()
+						if reply.Term > rf.currentTerm { // 变成follower
+							rf.role = ROLE_FOLLOWER
+							rf.leaderId = -1
+							rf.currentTerm = reply.Term
+							rf.votedFor = -1
+							rf.persist()
+						}
+						DPrintf("RaftNode[%d] appendEntries ends, peerTerm[%d] myCurrentTerm[%d] myRole[%s]", rf.me, reply.Term, rf.currentTerm, rf.role)
+					}
+				}(peerId, &args)
+			}
+		}()
+	}
 }
